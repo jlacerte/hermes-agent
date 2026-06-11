@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
+from contextlib import suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,43 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
 )
 from tools.url_safety import is_safe_url
+
+
+async def _wait_for_ready_or_bot_exit(
+    ready_event: asyncio.Event,
+    bot_task: asyncio.Task,
+    timeout: float,
+) -> None:
+    """Wait until Discord is ready, or surface early bot startup failure.
+
+    ``discord.py`` startup errors (including SOCKS/proxy failures from
+    aiohttp-socks/python-socks) happen inside ``Bot.start()``.  If ``connect()``
+    only waits on ``ready_event``, a dead background task still burns the full
+    ready timeout before the gateway supervisor can reconnect.  Racing the ready
+    event against the bot task keeps failures fast and preserves the original
+    exception for logging/classification.
+    """
+    ready_task = asyncio.create_task(ready_event.wait())
+    try:
+        done, _pending = await asyncio.wait(
+            {ready_task, bot_task},
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            raise asyncio.TimeoutError
+        if bot_task in done:
+            exc = bot_task.exception()
+            if exc is not None:
+                raise exc
+            if not ready_task.done():
+                raise RuntimeError("Discord bot task exited before ready")
+        await ready_task
+    finally:
+        if not ready_task.done():
+            ready_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await ready_task
 
 
 def _find_discord_windows_bundled_opus(discord_module: Any = None) -> Optional[str]:
@@ -622,6 +660,10 @@ class DiscordAdapter(BasePlatformAdapter):
         self._typing_tasks: Dict[str, asyncio.Task] = {}
         self._bot_task: Optional[asyncio.Task] = None
         self._post_connect_task: Optional[asyncio.Task] = None
+        # True while disconnect() is intentionally closing discord.py. The
+        # bot task's done callback uses this to distinguish an operator/service
+        # shutdown from a runtime websocket crash.
+        self._disconnecting = False
         # Dedup cache: prevents duplicate bot responses when Discord
         # RESUME replays events after reconnects.
         self._dedup = MessageDeduplicator()
@@ -633,6 +675,65 @@ class DiscordAdapter(BasePlatformAdapter):
         # history backfill to skip the full scan on hot paths.  Falls back to
         # scanning channel.history() on cache miss (cold start / restart).
         self._last_self_message_id: Dict[str, str] = {}
+
+    def _handle_bot_task_done(self, task: asyncio.Task) -> None:
+        """Surface post-startup discord.py task exits to the gateway supervisor.
+
+        discord.py reconnects normal gateway interruptions internally. When its
+        top-level ``Bot.start()`` task actually exits after the adapter has been
+        marked running, the Discord websocket is dead while the Hermes gateway
+        process can remain alive. Treat that split-brain state as a retryable
+        fatal adapter error so ``GatewayRunner._handle_adapter_fatal_error`` can
+        remove this adapter and queue Discord for the existing reconnect watcher.
+        """
+        if getattr(self, "_disconnecting", False):
+            # Intentional service/operator shutdown. Drain the task result so
+            # asyncio doesn't emit "exception was never retrieved" warnings.
+            with suppress(asyncio.CancelledError, Exception):
+                task.exception()
+            return
+
+        # Ignore stale callbacks from an older client if a reconnect already
+        # installed a newer Bot.start() task on this adapter instance.
+        if self._bot_task is not None and task is not self._bot_task:
+            with suppress(asyncio.CancelledError, Exception):
+                task.exception()
+            return
+
+        if not self._running:
+            # Startup failures are handled by _wait_for_ready_or_bot_exit() in
+            # connect(); this callback is only for post-startup split-brain.
+            with suppress(asyncio.CancelledError, Exception):
+                task.exception()
+            return
+
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        except Exception as err:  # pragma: no cover - defensive
+            exc = err
+
+        if exc is None:
+            message = "Discord gateway task exited without an exception"
+        else:
+            message = f"Discord gateway task exited: {exc}"
+
+        logger.error("[%s] %s", self.name, message, exc_info=exc if exc else False)
+        self._set_fatal_error("discord_gateway_task_exited", message, retryable=True)
+
+        async def _notify() -> None:
+            try:
+                await self._notify_fatal_error()
+            except Exception as notify_exc:  # pragma: no cover - defensive logging
+                logger.warning(
+                    "[%s] Failed to notify gateway supervisor about Discord task exit: %s",
+                    self.name,
+                    notify_exc,
+                    exc_info=True,
+                )
+
+        asyncio.create_task(_notify())
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -848,7 +949,20 @@ class DiscordAdapter(BasePlatformAdapter):
                     _ignore_no_mention = os.getenv(
                         "DISCORD_IGNORE_NO_MENTION", "true"
                     ).lower() in {"true", "1", "yes"}
-                    if _ignore_no_mention and not _self_mentioned and not _other_bots_mentioned:
+                    # Name triggers (e.g. "кработ", "крабик") count as being
+                    # addressed to us even when the message also @mentions a
+                    # human/role but not the bot — otherwise the name trigger
+                    # would be silently dropped here before _handle_message.
+                    # Config-gated: empty triggers → always False → no change.
+                    _name_addressed = adapter_self._discord_text_matches_name(
+                        message.content or ""
+                    )
+                    if (
+                        _ignore_no_mention
+                        and not _self_mentioned
+                        and not _other_bots_mentioned
+                        and not _name_addressed
+                    ):
                         _channel_id = str(message.channel.id)
                         _parent_id = None
                         if hasattr(message.channel, "parent_id") and message.channel.parent_id:
@@ -900,10 +1014,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 self._register_slash_commands()
 
             # Start the bot in background
+            self._disconnecting = False
             self._bot_task = asyncio.create_task(self._client.start(self.config.token))
+            self._bot_task.add_done_callback(self._handle_bot_task_done)
 
-            # Wait for ready
-            await asyncio.wait_for(self._ready_event.wait(), timeout=30)
+            # Wait for ready, but fail fast if discord.py's background startup
+            # task dies first (for example on SOCKS/proxy connect errors).
+            await _wait_for_ready_or_bot_exit(self._ready_event, self._bot_task, timeout=30)
 
             self._running = True
             return True
@@ -919,6 +1036,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Disconnect from Discord."""
+        self._disconnecting = True
         # Clean up all active voice connections before closing the client
         for guild_id in list(self._voice_clients.keys()):
             try:
@@ -1461,8 +1579,30 @@ class DiscordAdapter(BasePlatformAdapter):
                 return await self._send_to_forum(channel, content)
 
             # Format and split message if needed
-            formatted = self.format_message(content)
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            embeds_to_send = None
+            content_to_send = content
+            if content.strip().startswith("{") and content.strip().endswith("}"):
+                try:
+                    parsed = json.loads(content)
+                    if "embeds" in parsed or "embed" in parsed or "content" in parsed:
+                        content_to_send = parsed.get("content", "")
+                        raw_embeds = parsed.get("embeds", [])
+                        if "embed" in parsed:
+                            raw_embeds = [parsed["embed"]] + raw_embeds
+                        
+                        import discord
+                        embeds_to_send = []
+                        for e_dict in raw_embeds:
+                            if hasattr(discord.Embed, "from_dict"):
+                                embeds_to_send.append(discord.Embed.from_dict(e_dict))
+                except Exception as e:
+                    logger.debug("Failed to parse JSON content for embed: %s", e)
+
+            if embeds_to_send:
+                chunks = [content_to_send] if content_to_send else [""]
+            else:
+                formatted = self.format_message(content)
+                chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
             message_ids = []
             reference = None
@@ -1483,10 +1623,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
                 try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
-                    )
+                    if embeds_to_send and i == len(chunks) - 1:
+                        msg = await channel.send(
+                            content=chunk or None,
+                            embeds=embeds_to_send,
+                            reference=chunk_reference,
+                        )
+                    else:
+                        msg = await channel.send(
+                            content=chunk,
+                            reference=chunk_reference,
+                        )
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -3340,6 +3487,74 @@ class DiscordAdapter(BasePlatformAdapter):
             # so a rejected invoker can receive an ephemeral rejection.
             await self._handle_thread_create_slash(interaction, name, message, auto_archive_duration)
 
+
+        if os.getenv("HERMES_PRODUCERS_BREV_CARD", "true").strip().lower() not in {"0", "false", "no", "off"}:
+            class BrevTrackModal(discord.ui.Modal, title="заявка на трек"):
+                track_title = discord.ui.TextInput(
+                    label="название",
+                    placeholder="например: nocturnal pulse",
+                    required=True,
+                    max_length=120,
+                )
+                prompt = discord.ui.TextInput(
+                    label="описание",
+                    placeholder="идея, вайб, референсы, ограничения",
+                    style=discord.TextStyle.paragraph,
+                    required=True,
+                    max_length=1000,
+                )
+                style_text = discord.ui.TextInput(
+                    label="стиль",
+                    placeholder="neurodance, binaural asmr pulses, organic percussion",
+                    style=discord.TextStyle.paragraph,
+                    required=False,
+                    max_length=1000,
+                )
+                lyrics = discord.ui.TextInput(
+                    label="лирика",
+                    placeholder="оставь пустым для instrumental",
+                    style=discord.TextStyle.paragraph,
+                    required=False,
+                    max_length=4000,
+                )
+                options = discord.ui.TextInput(
+                    label="алиас и модель",
+                    placeholder="alias: /tag/neurofunk\nmodel: auto",
+                    style=discord.TextStyle.paragraph,
+                    required=False,
+                    max_length=500,
+                )
+
+                def __init__(self, adapter: "DiscordAdapter"):
+                    super().__init__()
+                    self.adapter = adapter
+
+                async def on_submit(self, interaction: discord.Interaction) -> None:
+                    if not await self.adapter._check_slash_authorization(interaction, "/brev-card"):
+                        return
+                    await interaction.response.defer(ephemeral=True)
+                    text = "\n".join([
+                        "кработ трек",
+                        f"название: {str(self.track_title.value).strip()}",
+                        f"описание: {str(self.prompt.value).strip()}",
+                        f"стиль: {str(self.style_text.value).strip()}",
+                        f"лирика: {str(self.lyrics.value).strip()}",
+                        "опции:",
+                        str(self.options.value).strip(),
+                    ]).strip()
+                    event = self.adapter._build_slash_event(interaction, text)
+                    await self.adapter.handle_message(event)
+                    try:
+                        await interaction.edit_original_response(content="карточка отправлена в генерацию")
+                    except Exception as exc:
+                        logger.debug("Discord brev modal ack failed: %s", exc)
+
+            @tree.command(name="brev-card", description="Открыть карточку заявки на трек Brev")
+            async def slash_brev_card(interaction: discord.Interaction):
+                if not await self._check_slash_authorization(interaction, "/brev-card"):
+                    return
+                await interaction.response.send_modal(BrevTrackModal(self))
+
         @tree.command(name="queue", description="Queue a prompt for the next turn (doesn't interrupt)")
         @discord.app_commands.describe(prompt="The prompt to queue")
         async def slash_queue(interaction: discord.Interaction, prompt: str):
@@ -3856,6 +4071,62 @@ class DiscordAdapter(BasePlatformAdapter):
                 return configured.lower() not in {"false", "0", "no", "off"}
             return bool(configured)
         return os.getenv("DISCORD_REQUIRE_MENTION", "true").lower() not in {"false", "0", "no", "off"}
+
+    def _discord_name_triggers(self) -> list:
+        """Return configured name wake-words that let the bot answer text-channel
+        messages without an @mention (e.g. "кработ", "крабик", "робби").
+
+        Empty by default → no behaviour change for any profile.  Configure via
+        the ``discord.name_triggers`` list in config.yaml or the comma-separated
+        ``DISCORD_NAME_TRIGGERS`` env var.
+        """
+        raw = self.config.extra.get("name_triggers")
+        if raw is None:
+            raw = os.getenv("DISCORD_NAME_TRIGGERS", "")
+        if isinstance(raw, list):
+            return [str(x).strip() for x in raw if str(x).strip()]
+        return [p.strip() for p in str(raw).split(",") if p.strip()]
+
+    def _discord_name_trigger_regex(self):
+        """Lazily compile + cache the name-trigger matcher.
+
+        Recompiles only when the configured list changes; returns ``None`` when
+        no triggers are configured so the hot path stays cheap.
+        """
+        import re
+
+        names = self._discord_name_triggers()
+        cache_key = tuple(sorted(n.lower() for n in names))
+        if getattr(self, "_name_trigger_key", None) == cache_key:
+            return self._name_trigger_rx
+        if not names:
+            self._name_trigger_key = cache_key
+            self._name_trigger_rx = None
+            return None
+        alt = "|".join(re.escape(n) for n in names)
+        # Unicode-aware boundaries: "бот" must NOT fire inside "работа"/"суббота".
+        self._name_trigger_rx = re.compile(rf"(?iu)(?<!\w)(?:{alt})(?!\w)")
+        self._name_trigger_key = cache_key
+        return self._name_trigger_rx
+
+    def _discord_text_matches_name(self, text: str) -> bool:
+        """True when ``text`` contains one of the configured bot name triggers."""
+        if not text:
+            return False
+        rx = self._discord_name_trigger_regex()
+        return bool(rx and rx.search(text))
+
+    def _discord_strip_leading_name(self, text: str) -> str:
+        """Strip a leading name trigger + trailing punctuation, mirroring the
+        voice wake-word cleanup so the agent receives the actual request."""
+        import re
+
+        names = self._discord_name_triggers()
+        if not text or not names:
+            return text
+        alt = "|".join(re.escape(n) for n in names)
+        stripped = re.sub(rf"(?iu)^\s*(?:{alt})(?!\w)[\s,:;!.\-—–]*", "", text).strip()
+        return stripped or text
 
     def _discord_allow_any_attachment(self) -> bool:
         """Return whether Discord attachments bypass the SUPPORTED_DOCUMENT_TYPES allowlist.
@@ -4819,9 +5090,27 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not self._discord_thread_require_mention()
             )
 
+            # Tracks whether this message reached the bot via a configured name
+            # wake-word rather than a real @mention.  Name-trigger replies are
+            # casual follow-ups (like Discord replies), so they answer inline in
+            # the current channel instead of spawning a fresh auto-thread.
+            matched_name_trigger = False
             if require_mention and not is_free_channel and not in_bot_thread:
                 if self._client.user not in message.mentions and not mention_prefix:
-                    return
+                    # Name triggers: configured wake-words (e.g. "кработ",
+                    # "крабик", "робби") substitute for an @mention in text
+                    # channels.  Disabled unless discord.name_triggers /
+                    # DISCORD_NAME_TRIGGERS is set, so other profiles are
+                    # unaffected.  Matched text has the leading name stripped so
+                    # the agent receives the actual request, mirroring the voice
+                    # wake-word cleanup.
+                    if self._discord_text_matches_name(normalized_content):
+                        normalized_content = self._discord_strip_leading_name(normalized_content)
+                        message.content = normalized_content
+                        mention_prefix = True
+                        matched_name_trigger = True
+                    else:
+                        return
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
         # Messages already inside threads or DMs are unaffected.
@@ -4833,7 +5122,13 @@ class DiscordAdapter(BasePlatformAdapter):
             skip_thread = bool(channel_ids & no_thread_channels) or is_free_channel
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
-            if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
+            if (
+                auto_thread
+                and not skip_thread
+                and not is_voice_linked_channel
+                and not is_reply_message
+                and not matched_name_trigger
+            ):
                 thread = await self._auto_create_thread(message)
                 if thread:
                     parent_channel_id = str(message.channel.id)
@@ -4942,12 +5237,64 @@ class DiscordAdapter(BasePlatformAdapter):
                     ext = "." + content_type.split("/")[-1].split(";")[0]
                     if ext not in {".ogg", ".mp3", ".wav", ".webm", ".m4a"}:
                         ext = ".ogg"
-                    cached_path = await self._cache_discord_audio(att, ext)
-                    media_urls.append(cached_path)
-                    media_types.append(content_type)
-                    print(f"[Discord] Cached user audio: {cached_path}", flush=True)
+                    
+                    n8n_webhook_url = self.config.extra.get("n8n_audio_webhook_url") or os.getenv("DISCORD_N8N_AUDIO_WEBHOOK_URL")
+                    if n8n_webhook_url:
+                        import aiohttp
+                        from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
+                        
+                        await self.send_typing(str(effective_channel.id))
+                        try:
+                            payload = {
+                                "message_id": str(message.id),
+                                "channel_id": str(message.channel.id),
+                                "author_id": str(message.author.id),
+                                "author_name": message.author.name,
+                                "content": message.content,
+                                "audio_attachments": [
+                                    {
+                                        "id": str(att.id),
+                                        "filename": att.filename,
+                                        "size": att.size,
+                                        "url": att.url,
+                                        "proxy_url": att.proxy_url
+                                    }
+                                ]
+                            }
+                            
+                            _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
+                            _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
+                            
+                            logger.info("[Discord] Routing audio to n8n webhook: %s", n8n_webhook_url)
+                            async with aiohttp.ClientSession(**_sess_kw) as session:
+                                async with session.post(
+                                    n8n_webhook_url,
+                                    json=payload,
+                                    timeout=aiohttp.ClientTimeout(total=15),
+                                    **_req_kw
+                                ) as resp:
+                                    if resp.status >= 400:
+                                        raise Exception(f"n8n webhook returned HTTP {resp.status}")
+                                    response_data = await resp.json()
+                                    if response_data and "reply" in response_data:
+                                        reply_text = response_data["reply"]
+                                        if pending_text_injection:
+                                            pending_text_injection = f"{pending_text_injection}\n\n[n8n Audio Analysis]: {reply_text}"
+                                        else:
+                                            pending_text_injection = f"[n8n Audio Analysis]: {reply_text}"
+                        finally:
+                            await self.stop_typing(str(effective_channel.id))
+                        
+                        media_urls.append(att.url)
+                        media_types.append(content_type)
+                        print(f"[Discord] Routed audio to n8n: {att.filename}", flush=True)
+                    else:
+                        cached_path = await self._cache_discord_audio(att, ext)
+                        media_urls.append(cached_path)
+                        media_types.append(content_type)
+                        print(f"[Discord] Cached user audio: {cached_path}", flush=True)
                 except Exception as e:
-                    print(f"[Discord] Failed to cache audio attachment: {e}", flush=True)
+                    print(f"[Discord] Failed to process audio attachment: {e}", flush=True)
                     media_urls.append(att.url)
                     media_types.append(content_type)
             else:
@@ -6340,7 +6687,17 @@ async def _standalone_send(
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             # Send text message (skip if empty and media is present)
             if message.strip() or not media_files:
-                async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
+                payload = {"content": message}
+                if message.strip().startswith("{") and message.strip().endswith("}"):
+                    try:
+                        parsed = json.loads(message)
+                        if "embeds" in parsed or "embed" in parsed or "content" in parsed:
+                            payload = parsed
+                            if "embed" in payload and "embeds" not in payload:
+                                payload["embeds"] = [payload.pop("embed")]
+                    except Exception:
+                        pass
+                async with session.post(url, headers=json_headers, json=payload, **_req_kw) as resp:
                     if resp.status not in {200, 201}:
                         body = await resp.text()
                         return {"error": f"Discord API error ({resp.status}): {body}"}
@@ -6484,7 +6841,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     ``DISCORD_IGNORED_CHANNELS``, ``DISCORD_ALLOWED_CHANNELS``,
     ``DISCORD_NO_THREAD_CHANNELS``, ``DISCORD_HISTORY_BACKFILL``,
     ``DISCORD_HISTORY_BACKFILL_LIMIT``, ``DISCORD_ALLOW_MENTION_*``,
-    ``DISCORD_REPLY_TO_MODE``, ``DISCORD_THREAD_REQUIRE_MENTION``).
+    ``DISCORD_REPLY_TO_MODE``, ``DISCORD_THREAD_REQUIRE_MENTION``,
+    ``DISCORD_NAME_TRIGGERS``).
     Rather than rewrite ~50 call sites inside the adapter to read from
     ``PlatformConfig.extra`` instead, this hook keeps the existing
     env-driven model and merely owns the YAML→env translation here, next to
@@ -6499,6 +6857,15 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         os.environ["DISCORD_REQUIRE_MENTION"] = str(discord_cfg["require_mention"]).lower()
     if "thread_require_mention" in discord_cfg and not os.getenv("DISCORD_THREAD_REQUIRE_MENTION"):
         os.environ["DISCORD_THREAD_REQUIRE_MENTION"] = str(discord_cfg["thread_require_mention"]).lower()
+    nt = discord_cfg.get("name_triggers")
+    if nt is not None and not os.getenv("DISCORD_NAME_TRIGGERS"):
+        if isinstance(nt, list):
+            nt = ",".join(str(v) for v in nt)
+        os.environ["DISCORD_NAME_TRIGGERS"] = str(nt)
+        logger.info(
+            "[Discord] Name triggers enabled from config: %s",
+            os.environ["DISCORD_NAME_TRIGGERS"],
+        )
     platforms_cfg = yaml_cfg.get("platforms")
     platform_extra_cfg = {}
     if isinstance(platforms_cfg, dict):
