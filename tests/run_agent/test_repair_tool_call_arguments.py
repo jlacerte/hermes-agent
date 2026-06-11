@@ -130,6 +130,31 @@ class TestRepairToolCallArguments:
         parsed = json.loads(result)
         assert parsed["msg"] == "has\tliteral\ttabs"
 
+    # -- Concatenated JSON objects (Gemini parallel call deltas) --
+    # Some Gemini models stream parallel function-call argument deltas
+    # concatenated into a single arguments string, e.g.
+    #   {"search": "a"}{"search": "b"}{"search": "c"}
+    # json.loads rejects this as "Extra data" and the brace counts are
+    # balanced, so the old pipeline dropped everything to {}. We keep the
+    # first complete object (the model's primary call).
+
+    def test_concatenated_objects_keeps_first(self):
+        raw = '{"search": "a"}{"search": "b"}{"search": "c"}'
+        result = _repair_tool_call_arguments(raw, "zoho_list_items")
+        assert json.loads(result) == {"search": "a"}
+
+    def test_concatenated_objects_with_limit_keeps_first(self):
+        raw = '{"limit": 50, "search": "glycol"}{"limit": 50, "search": "Manometre"}'
+        result = _repair_tool_call_arguments(raw, "zoho_list_items")
+        assert json.loads(result) == {"limit": 50, "search": "glycol"}
+
+    def test_concatenated_objects_not_dropped_to_empty(self):
+        """Regression: the concat case must NOT degrade to {}."""
+        raw = '{"search": "manometre"}{"search": "heures"}'
+        result = _repair_tool_call_arguments(raw, "t")
+        assert result != "{}"
+        assert json.loads(result) == {"search": "manometre"}
+
     # -- Stage 4: control-char escape fallback --
 
     def test_control_chars_with_trailing_comma(self):

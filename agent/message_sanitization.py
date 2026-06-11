@@ -220,6 +220,29 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
 
+    # Repair pass 0b: concatenated JSON objects. Some Gemini models stream
+    # PARALLEL function-call argument deltas concatenated into a single
+    # arguments string, e.g. {"search": "a"}{"search": "b"}{"search": "c"}.
+    # json.loads rejects this as "Extra data" and the brace counts are
+    # balanced, so the brace-repair below can't help — the whole call would
+    # degrade to {} and the model's search would be silently lost. Decode
+    # the first complete object (the model's primary call) and discard the
+    # rest. Documented Gemini streaming quirk: arg deltas must be split per
+    # functionCall part. See agent.log "Unrepairable tool_call" regression.
+    try:
+        decoder = json.JSONDecoder()
+        first_obj, end = decoder.raw_decode(raw_stripped)
+        if isinstance(first_obj, dict) and raw_stripped[end:].strip():
+            reserialised = json.dumps(first_obj, separators=(",", ":"))
+            logger.warning(
+                "Repaired concatenated tool_call arguments for %s "
+                "(kept first of multiple objects): %s",
+                tool_name, raw_stripped[:80],
+            )
+            return reserialised
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+
     # Attempt common JSON repairs
     fixed = raw_stripped
     # 1. Strip trailing commas before } or ]
