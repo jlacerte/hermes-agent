@@ -658,15 +658,28 @@ def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices:
             except (TypeError, ValueError):
                 args_str = "{}"
             thought_signature = part.get("thoughtSignature") if isinstance(part.get("thoughtSignature"), str) else ""
-            call_key = json.dumps(
-                {
-                    "part_index": part_index,
-                    "name": name,
-                    "thought_signature": thought_signature,
-                },
-                sort_keys=True,
-            )
-            slot = tool_call_indices.get(call_key)
+            
+            generation = 0
+            while True:
+                call_key = json.dumps(
+                    {
+                        "part_index": part_index,
+                        "name": name,
+                        "thought_signature": thought_signature,
+                        "generation": generation,
+                    },
+                    sort_keys=True,
+                )
+                slot = tool_call_indices.get(call_key)
+                if slot is None:
+                    break
+                
+                last_args = str(slot.get("last_arguments") or "")
+                if last_args == args_str or args_str.startswith(last_args):
+                    break
+                
+                generation += 1
+
             if slot is None:
                 slot = {
                     "index": len(tool_call_indices),
