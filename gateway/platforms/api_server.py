@@ -1741,6 +1741,19 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
 
+        # AG-UI / OpenAI tool passthrough: capture client-supplied tool definitions
+        # and tool_choice so we can inject them into the agent surface.
+        # client_tools is a list of OpenAI function-tool objects:
+        #   [{"type": "function", "function": {"name": ..., "description": ..., "parameters": ...}}, ...]
+        # When empty, behaviour is unchanged (full rétrocompat).
+        client_tools: List[Dict[str, Any]] = body.get("tools") or []
+        client_tool_choice = body.get("tool_choice")  # reserved for future use
+        client_tool_names: set = {
+            t.get("function", {}).get("name")
+            for t in client_tools
+            if isinstance(t, dict) and t.get("function", {}).get("name")
+        }
+
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
         conversation_messages: List[Dict[str, str]] = []
@@ -1761,7 +1774,27 @@ class APIServerAdapter(BasePlatformAdapter):
                     content = _normalize_multimodal_content(raw_content)
                 except ValueError as exc:
                     return _multimodal_validation_error(exc, param=f"messages[{idx}].content")
-                conversation_messages.append({"role": role, "content": content})
+                # AG-UI / Point 3: preserve tool_calls on assistant messages so the
+                # LLM can see its own prior decisions in the conversation history.
+                # Also preserve tool_call_id for role=assistant messages that are
+                # themselves a tool result marker (uncommon but valid).
+                entry: Dict[str, Any] = {"role": role, "content": content}
+                if role == "assistant" and msg.get("tool_calls"):
+                    entry["tool_calls"] = msg["tool_calls"]
+                conversation_messages.append(entry)
+            elif role == "tool":
+                # AG-UI / Point 3: tool-result messages sent back by the client
+                # after the model emitted tool_calls. Preserve them verbatim so
+                # the agent's conversation history reflects the client execution.
+                tool_entry: Dict[str, Any] = {
+                    "role": "tool",
+                    "content": raw_content if isinstance(raw_content, str) else json.dumps(raw_content),
+                }
+                if msg.get("tool_call_id"):
+                    tool_entry["tool_call_id"] = msg["tool_call_id"]
+                if msg.get("name"):
+                    tool_entry["name"] = msg["name"]
+                conversation_messages.append(tool_entry)
 
         # Extract the last user message as the primary input
         user_message: Any = ""
@@ -1871,8 +1904,55 @@ class APIServerAdapter(BasePlatformAdapter):
                 Skips tools whose names start with ``_`` so internal
                 events (``_thinking``, …) stay off the wire — matching
                 the prior ``_on_tool_progress`` filter exactly.
+
+                AG-UI / Point 2 (stream): when the invoked tool is a
+                *client* tool (i.e. its name is in client_tool_names), we
+                must NOT execute it server-side.  Instead we emit a
+                Chat-Completions chunk with finish_reason=tool_calls so
+                the AG-UI front-end can execute the call and send the
+                result back as a tool message.  The agent is then
+                interrupted so it does not attempt to execute the tool.
                 """
                 if not tool_call_id or function_name.startswith("_"):
+                    return
+                # AG-UI passthrough: client tool → relay as tool_calls chunk, interrupt
+                if function_name in client_tool_names:
+                    args_str = function_args if isinstance(function_args, str) else json.dumps(function_args or {})
+                    tool_calls_chunk = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model_name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": tool_call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": function_name,
+                                        "arguments": args_str,
+                                    },
+                                }],
+                            },
+                            "finish_reason": None,
+                        }],
+                    }
+                    _stream_q.put(("__tool_calls_chunk__", tool_calls_chunk))
+                    finish_chunk = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model_name,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                    }
+                    _stream_q.put(("__tool_calls_chunk__", finish_chunk))
+                    # Interrupt the agent so it does not execute the client tool
+                    _agent = agent_ref[0] if agent_ref else None
+                    if _agent is not None:
+                        try:
+                            _agent.interrupt("client_tool_passthrough")
+                        except Exception:
+                            pass
                     return
                 _started_tool_call_ids.add(tool_call_id)
                 from agent.display import build_tool_preview, get_tool_emoji
@@ -1920,6 +2000,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                client_tools=client_tools,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -1932,6 +2013,26 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
+        # AG-UI / Point 2 (non-stream): capture client tool_calls via a
+        # lightweight callback so we can return finish_reason=tool_calls.
+        _captured_client_tool_calls: List[Dict[str, Any]] = []
+        _nonstream_agent_ref: list = [None]
+
+        def _nonstream_on_tool_start(tool_call_id, function_name, function_args):
+            if function_name in client_tool_names:
+                args_str = function_args if isinstance(function_args, str) else json.dumps(function_args or {})
+                _captured_client_tool_calls.append({
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {"name": function_name, "arguments": args_str},
+                })
+                _agent = _nonstream_agent_ref[0]
+                if _agent is not None:
+                    try:
+                        _agent.interrupt("client_tool_passthrough")
+                    except Exception:
+                        pass
+
         async def _compute_completion():
             return await self._run_agent(
                 user_message=user_message,
@@ -1939,6 +2040,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                client_tools=client_tools,
+                tool_start_callback=_nonstream_on_tool_start if client_tool_names else None,
+                agent_ref=_nonstream_agent_ref if client_tool_names else None,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -1967,6 +2071,34 @@ class APIServerAdapter(BasePlatformAdapter):
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
         err_msg = result.get("error")
+
+        # AG-UI / Point 2 (non-stream): if any client tool_calls were captured,
+        # return them immediately with finish_reason=tool_calls so the front-end
+        # can execute them and send tool messages back.
+        if _captured_client_tool_calls:
+            tc_response = {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": _captured_client_tool_calls,
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+                "usage": {
+                    "prompt_tokens": usage.get("input_tokens", 0),
+                    "completion_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                },
+            }
+            return web.json_response(tc_response, headers={
+                "X-Hermes-Session-Id": result.get("session_id", session_id),
+            })
 
         # Decide finish_reason. OpenAI uses "length" for truncation, "stop"
         # for normal completion, and downstream SDKs accept "error" / custom
@@ -2074,6 +2206,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             last_activity = time.monotonic()
+            # AG-UI / Point 2 (stream): track if we already emitted finish_reason=tool_calls
+            # so we can skip the trailing finish_reason=stop chunk.
+            _tool_calls_finish_emitted = False
 
             # Role chunk
             role_chunk = {
@@ -2094,12 +2229,28 @@ class APIServerAdapter(BasePlatformAdapter):
                 frontends can display them without storing the markers in
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
+
+                AG-UI / Point 2 (stream): tuples ``("__tool_calls_chunk__", chunk)``
+                are pre-built chat.completion.chunk dicts for client tool_calls;
+                written verbatim as ``data: ...`` (standard SSE data line, no
+                custom event prefix so OpenAI SDK clients parse them normally).
+                When the chunk carries finish_reason=tool_calls we set a flag so
+                the normal finish_reason=stop chunk is suppressed.
                 """
+                nonlocal _tool_calls_finish_emitted
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     event_data = json.dumps(item[1])
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_calls_chunk__":
+                    # Pre-built chunk — write verbatim as a standard SSE data line.
+                    chunk_data = item[1]
+                    await response.write(f"data: {json.dumps(chunk_data)}\n\n".encode())
+                    # Detect finish_reason=tool_calls to suppress the trailing stop chunk.
+                    for ch in chunk_data.get("choices", []):
+                        if ch.get("finish_reason") == "tool_calls":
+                            _tool_calls_finish_emitted = True
                 else:
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
@@ -2144,18 +2295,20 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.warning("Agent task %s failed, usage data lost: %s", completion_id, exc)
 
-            # Finish chunk
-            finish_chunk = {
-                "id": completion_id, "object": "chat.completion.chunk",
-                "created": created, "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                "usage": {
-                    "prompt_tokens": usage.get("input_tokens", 0),
-                    "completion_tokens": usage.get("output_tokens", 0),
-                    "total_tokens": usage.get("total_tokens", 0),
-                },
-            }
-            await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
+            # Finish chunk — suppressed when a tool_calls finish was already emitted
+            # (AG-UI passthrough path) so the client doesn't see a spurious "stop".
+            if not _tool_calls_finish_emitted:
+                finish_chunk = {
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": usage.get("input_tokens", 0),
+                        "completion_tokens": usage.get("output_tokens", 0),
+                        "total_tokens": usage.get("total_tokens", 0),
+                    },
+                }
+                await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
             # Client disconnected mid-stream.  Interrupt the agent so it
@@ -3495,6 +3648,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        client_tools: Optional[List[Dict[str, Any]]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -3506,6 +3660,11 @@ class APIServerAdapter(BasePlatformAdapter):
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
         callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
         another thread to stop in-progress LLM calls.
+
+        AG-UI / Point 1: ``client_tools`` is an optional list of OpenAI-format
+        tool definitions supplied by the caller via ``body["tools"]``.  When
+        non-empty they are appended to ``agent.tools`` after init so the model
+        sees them alongside the server toolsets.  Duplicate names are skipped.
         """
         loop = asyncio.get_running_loop()
 
@@ -3528,6 +3687,24 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_complete_callback=tool_complete_callback,
                     gateway_session_key=gateway_session_key,
                 )
+                # AG-UI / Point 1: inject client-supplied tool definitions into
+                # the agent surface so they are visible to the model.  We append
+                # only unknown names to avoid shadowing server-side tools.
+                if client_tools:
+                    _existing = {
+                        t.get("function", {}).get("name")
+                        for t in (agent.tools or [])
+                        if isinstance(t, dict)
+                    }
+                    for ct in client_tools:
+                        if not isinstance(ct, dict):
+                            continue
+                        cname = ct.get("function", {}).get("name")
+                        if cname and cname not in _existing:
+                            agent.tools = agent.tools or []
+                            agent.tools.append(ct)
+                            agent.valid_tool_names.add(cname)
+                            _existing.add(cname)
                 if agent_ref is not None:
                     agent_ref[0] = agent
                 effective_task_id = session_id or str(uuid.uuid4())
