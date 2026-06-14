@@ -3026,12 +3026,82 @@ class APIServerAdapter(BasePlatformAdapter):
                 if isinstance(item, str):
                     input_messages.append({"role": "user", "content": item})
                 elif isinstance(item, dict):
+                    # AG-UI / HITL round-trip: the Responses API uses native
+                    # item types for the tool round-trip. These items have NO
+                    # "role" field — handling them as plain {role:"user"} would
+                    # drop the tool result (the cause of the 400 "No user
+                    # message found in input"). Map them to the tool_calls /
+                    # role=tool shape the agent understands (parity with
+                    # _handle_chat_completions input parsing, lignes ~1780-1797).
+                    item_type = item.get("type")
+                    if item_type == "function_call":
+                        # Assistant decided to call a tool. Reconstruct an
+                        # assistant message carrying tool_calls so the agent
+                        # sees its own prior decision in the history.
+                        call_id = item.get("call_id") or item.get("id") or ""
+                        input_messages.append({
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [{
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name", ""),
+                                    "arguments": item.get("arguments", "") or "",
+                                },
+                            }],
+                        })
+                        continue
+                    if item_type == "function_call_output":
+                        # Tool result returned by the client. The native shape
+                        # carries the result in "output" (str, or a list of
+                        # {type:"input_text", text:...} parts). Flatten to text.
+                        raw_out = item.get("output", "")
+                        if isinstance(raw_out, list):
+                            _parts = []
+                            for _p in raw_out:
+                                if isinstance(_p, dict):
+                                    _parts.append(_p.get("text", ""))
+                                elif isinstance(_p, str):
+                                    _parts.append(_p)
+                            out_text = "".join(_parts)
+                        elif isinstance(raw_out, str):
+                            out_text = raw_out
+                        else:
+                            out_text = json.dumps(raw_out)
+                        tool_msg: Dict[str, Any] = {"role": "tool", "content": out_text}
+                        if item.get("call_id") or item.get("id"):
+                            tool_msg["tool_call_id"] = item.get("call_id") or item.get("id")
+                        if item.get("name"):
+                            tool_msg["name"] = item["name"]
+                        input_messages.append(tool_msg)
+                        continue
+
                     role = item.get("role", "user")
+                    if role == "tool":
+                        # Chat-style tool-result message (role=tool). Preserve
+                        # tool_call_id + name verbatim so the agent can correlate.
+                        raw_content = item.get("content", "")
+                        tool_entry: Dict[str, Any] = {
+                            "role": "tool",
+                            "content": raw_content if isinstance(raw_content, str) else json.dumps(raw_content),
+                        }
+                        if item.get("tool_call_id"):
+                            tool_entry["tool_call_id"] = item["tool_call_id"]
+                        if item.get("name"):
+                            tool_entry["name"] = item["name"]
+                        input_messages.append(tool_entry)
+                        continue
                     try:
                         content = _normalize_multimodal_content(item.get("content", ""))
                     except ValueError as exc:
                         return _multimodal_validation_error(exc, param=f"input[{idx}].content")
-                    input_messages.append({"role": role, "content": content})
+                    entry: Dict[str, Any] = {"role": role, "content": content}
+                    # Preserve tool_calls on assistant messages so the LLM sees
+                    # its own prior tool decisions in the conversation history.
+                    if role == "assistant" and item.get("tool_calls"):
+                        entry["tool_calls"] = item["tool_calls"]
+                    input_messages.append(entry)
         else:
             return web.json_response(_openai_error("'input' must be a string or array"), status=400)
 
