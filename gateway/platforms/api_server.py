@@ -3378,6 +3378,381 @@ class APIServerAdapter(BasePlatformAdapter):
         })
 
     # ------------------------------------------------------------------
+    # AG-UI bridge (CopilotKit V2) — Option (b), Archon doc dc032870.
+    # ADDED routes only; existing handlers untouched. Reuses _run_agent
+    # in-process (same multi-tool round-trip proven by /v1/responses).
+    # ------------------------------------------------------------------
+
+    _AGUI_PROTOCOL_VERSION = "0.0.1"
+
+    @staticmethod
+    def _agui_normalize_tools(raw_tools) -> List[Dict[str, Any]]:
+        """AG-UI flat tool {name,description,parameters} -> nested Chat shape
+        {type:function, function:{...}} that _run_agent expects."""
+        client_tools: List[Dict[str, Any]] = []
+        for t in raw_tools or []:
+            if not isinstance(t, dict):
+                continue
+            if "function" in t:
+                client_tools.append(t)
+            elif t.get("name"):
+                client_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": t.get("name"),
+                        "description": t.get("description", ""),
+                        "parameters": t.get("parameters", {}),
+                    },
+                })
+        return client_tools
+
+    async def _handle_agui_info(self, request: "web.Request") -> "web.Response":
+        """GET /ag-ui/info — agent discovery for CopilotKit V2.
+
+        The AG-UI core only reads {version, agents:{<id>:{description}}}.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return web.json_response({
+            "version": self._AGUI_PROTOCOL_VERSION,
+            "agents": {
+                "default": {
+                    "description": "Philippe — assistant Mécanique Gicleurs (Hermès)",
+                },
+            },
+        })
+
+    async def _handle_agui_run(self, request: "web.Request") -> "web.StreamResponse":
+        """POST /ag-ui/agent/{agent_id}/run (and /connect) — AG-UI run.
+
+        Parses a RunAgentInput body, maps it onto _run_agent, and streams
+        AG-UI SSE events (data: <json>\\n\\n). Mapping (doc dc032870):
+          messages  -> conversation_history + last user message
+          tools     -> client_tools (frontend action passthrough)
+          context   -> ephemeral_system_prompt (unblocks readable multi-turn)
+          deltas    -> TEXT_MESSAGE_*  | tool starts -> TOOL_CALL_*
+          completes -> TOOL_CALL_RESULT | end -> RUN_FINISHED / RUN_ERROR
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        gateway_session_key, key_err = self._parse_session_key_header(request)
+        if key_err is not None:
+            return key_err
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(
+                {"error": {"message": "Invalid JSON in request body", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        thread_id = body.get("threadId") or str(uuid.uuid4())
+        run_id = body.get("runId") or str(uuid.uuid4())
+        raw_messages = body.get("messages") or []
+        raw_context = body.get("context") or []
+        raw_tools = body.get("tools") or []
+
+        # tools -> client_tools. When the model invokes one, the agent must
+        # NOT execute it server-side (relayed to the client instead).
+        client_tools = self._agui_normalize_tools(raw_tools)
+        client_tool_names: set = {
+            t.get("function", {}).get("name")
+            for t in client_tools
+            if isinstance(t, dict) and t.get("function", {}).get("name")
+        }
+
+        # context (useAgentContext entries [{description,value}]) ->
+        # ephemeral system prompt. THIS is what lets the model "see" what is
+        # currently open in the panel and answer follow-up questions on it.
+        ephemeral_system_prompt = None
+        ctx_lines: List[str] = []
+        for c in raw_context:
+            if not isinstance(c, dict):
+                continue
+            desc = c.get("description", "")
+            val = c.get("value", "")
+            if isinstance(val, (dict, list)):
+                val = json.dumps(val, ensure_ascii=False)
+            line = f"{desc}: {val}".strip().strip(":").strip()
+            if line:
+                ctx_lines.append(line)
+        if ctx_lines:
+            ephemeral_system_prompt = (
+                "Contexte courant de l'interface (fourni par le frontend):\n"
+                + "\n".join(ctx_lines)
+            )
+
+        # messages -> chat-format list, then split off the last user message.
+        mapped: List[Dict[str, Any]] = []
+        for m in raw_messages:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role", "user")
+            content = m.get("content", "") or ""
+            if role == "assistant":
+                entry: Dict[str, Any] = {"role": "assistant", "content": content}
+                tcs = m.get("toolCalls") or m.get("tool_calls")
+                if tcs:
+                    norm_tcs = []
+                    for tc in tcs:
+                        if not isinstance(tc, dict):
+                            continue
+                        fn = tc.get("function", {}) or {}
+                        norm_tcs.append({
+                            "id": tc.get("id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": fn.get("name", ""),
+                                "arguments": fn.get("arguments", "") or "",
+                            },
+                        })
+                    if norm_tcs:
+                        entry["tool_calls"] = norm_tcs
+                mapped.append(entry)
+            elif role == "tool":
+                tool_entry: Dict[str, Any] = {
+                    "role": "tool",
+                    "content": content if isinstance(content, str) else json.dumps(content),
+                }
+                tcid = m.get("toolCallId") or m.get("tool_call_id")
+                if tcid:
+                    tool_entry["tool_call_id"] = tcid
+                mapped.append(tool_entry)
+            else:
+                mapped.append({"role": role, "content": content})
+
+        last_user_idx = None
+        for i in range(len(mapped) - 1, -1, -1):
+            if mapped[i].get("role") == "user":
+                last_user_idx = i
+                break
+        if last_user_idx is not None:
+            user_message = mapped[last_user_idx].get("content", "")
+            conversation_history = mapped[:last_user_idx] + mapped[last_user_idx + 1:]
+        else:
+            # HITL continuation with no trailing user turn: feed everything as
+            # history and let the agent resume from the tool result.
+            user_message = ""
+            conversation_history = mapped
+
+        session_id = thread_id or str(uuid.uuid4())
+
+        # ── SSE setup: thread-safe queue fed by _run_agent callbacks ──
+        import queue as _q
+        _stream_q: "_q.Queue" = _q.Queue()
+
+        def _on_delta(delta):
+            if delta is not None:
+                _stream_q.put(delta)
+
+        def _on_tool_start(tool_call_id, function_name, function_args):
+            _stream_q.put(("__tool_started__", {
+                "tool_call_id": tool_call_id,
+                "name": function_name,
+                "arguments": function_args or {},
+            }))
+            # A *client* tool has no server impl: relay to client + interrupt
+            # so the agent doesn't try to run it (parity with /v1/responses).
+            if function_name in client_tool_names:
+                _agent = agent_ref[0] if agent_ref else None
+                if _agent is not None:
+                    try:
+                        _agent.interrupt("client_tool_passthrough")
+                    except Exception:
+                        pass
+
+        def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
+            _stream_q.put(("__tool_completed__", {
+                "tool_call_id": tool_call_id,
+                "name": function_name,
+                "result": function_result,
+            }))
+
+        agent_ref = [None]
+        agent_task = asyncio.ensure_future(self._run_agent(
+            user_message=user_message,
+            conversation_history=conversation_history,
+            ephemeral_system_prompt=ephemeral_system_prompt,
+            session_id=session_id,
+            stream_delta_callback=_on_delta,
+            tool_start_callback=_on_tool_start,
+            tool_complete_callback=_on_tool_complete,
+            agent_ref=agent_ref,
+            gateway_session_key=gateway_session_key,
+            client_tools=client_tools,
+        ))
+        agent_task.add_done_callback(lambda _fut: _stream_q.put(None))
+
+        return await self._write_sse_agui(
+            request=request,
+            thread_id=thread_id,
+            run_id=run_id,
+            stream_q=_stream_q,
+            agent_task=agent_task,
+            agent_ref=agent_ref,
+            session_id=session_id,
+            gateway_session_key=gateway_session_key,
+        )
+
+    async def _write_sse_agui(
+        self,
+        request: "web.Request",
+        thread_id: str,
+        run_id: str,
+        stream_q,
+        agent_task,
+        agent_ref,
+        session_id: str,
+        gateway_session_key: Optional[str] = None,
+    ) -> "web.StreamResponse":
+        """Drain the agent queue and emit AG-UI SSE events.
+
+        Wire format: ``data: <json>\\n\\n`` (text/event-stream).
+        """
+        import queue as _q
+
+        sse_headers = {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+        origin = request.headers.get("Origin", "")
+        cors = self._cors_headers_for_origin(origin) if origin else None
+        if cors:
+            sse_headers.update(cors)
+        if session_id:
+            sse_headers["X-Hermes-Session-Id"] = session_id
+        if gateway_session_key:
+            sse_headers["X-Hermes-Session-Key"] = gateway_session_key
+        response = web.StreamResponse(status=200, headers=sse_headers)
+        await response.prepare(request)
+
+        text_msg_id: Optional[str] = None
+        final_text_parts: List[str] = []
+        agent_error: Optional[str] = None
+
+        async def _emit(event: Dict[str, Any]) -> None:
+            await response.write(f"data: {json.dumps(event)}\n\n".encode())
+
+        async def _open_text() -> None:
+            nonlocal text_msg_id
+            if text_msg_id is not None:
+                return
+            text_msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+            await _emit({"type": "TEXT_MESSAGE_START", "messageId": text_msg_id, "role": "assistant"})
+
+        async def _close_text() -> None:
+            nonlocal text_msg_id
+            if text_msg_id is None:
+                return
+            await _emit({"type": "TEXT_MESSAGE_END", "messageId": text_msg_id})
+            text_msg_id = None
+
+        async def _emit_text_delta(delta: str) -> None:
+            await _open_text()
+            final_text_parts.append(delta)
+            await _emit({"type": "TEXT_MESSAGE_CONTENT", "messageId": text_msg_id, "delta": delta})
+
+        async def _emit_tool_started(payload: Dict[str, Any]) -> None:
+            # AG-UI keeps text and tool-call streams separate: close any open
+            # assistant text message before emitting a tool call.
+            await _close_text()
+            call_id = payload.get("tool_call_id") or f"call_{uuid.uuid4().hex[:16]}"
+            name = payload.get("name", "")
+            args = payload.get("arguments", {})
+            args_str = json.dumps(args) if isinstance(args, (dict, list)) else str(args)
+            await _emit({"type": "TOOL_CALL_START", "toolCallId": call_id, "toolCallName": name})
+            if args_str and args_str != "{}":
+                await _emit({"type": "TOOL_CALL_ARGS", "toolCallId": call_id, "delta": args_str})
+            await _emit({"type": "TOOL_CALL_END", "toolCallId": call_id})
+
+        async def _emit_tool_completed(payload: Dict[str, Any]) -> None:
+            call_id = payload.get("tool_call_id")
+            result = payload.get("result", "")
+            result_str = result if isinstance(result, str) else json.dumps(result)
+            await _emit({
+                "type": "TOOL_CALL_RESULT",
+                "messageId": f"msg_{uuid.uuid4().hex[:24]}",
+                "toolCallId": call_id,
+                "content": result_str,
+                "role": "tool",
+            })
+
+        async def _dispatch(it) -> None:
+            if isinstance(it, tuple) and len(it) == 2 and isinstance(it[0], str):
+                tag, payload = it
+                if tag == "__tool_started__":
+                    await _emit_tool_started(payload)
+                elif tag == "__tool_completed__":
+                    await _emit_tool_completed(payload)
+            elif isinstance(it, str):
+                await _emit_text_delta(it)
+
+        try:
+            await _emit({"type": "RUN_STARTED", "threadId": thread_id, "runId": run_id})
+            last_activity = time.monotonic()
+            loop = asyncio.get_running_loop()
+            while True:
+                try:
+                    item = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))
+                except _q.Empty:
+                    if agent_task.done():
+                        while True:
+                            try:
+                                item = stream_q.get_nowait()
+                                if item is None:
+                                    break
+                                await _dispatch(item)
+                            except _q.Empty:
+                                break
+                        break
+                    if time.monotonic() - last_activity >= CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS:
+                        await response.write(b": keepalive\n\n")
+                        last_activity = time.monotonic()
+                    continue
+                if item is None:  # EOS sentinel
+                    break
+                await _dispatch(item)
+                last_activity = time.monotonic()
+
+            await _close_text()
+
+            try:
+                result, _usage = await agent_task
+                agent_final = result.get("final_response", "") if isinstance(result, dict) else ""
+                # Some providers only emit the full response at the end.
+                if agent_final and not final_text_parts:
+                    await _emit_text_delta(agent_final)
+                    await _close_text()
+                if isinstance(result, dict) and result.get("error") and not final_text_parts:
+                    agent_error = result["error"]
+            except Exception as e:  # noqa: BLE001
+                logger.error("Error running agent for AG-UI run: %s", e, exc_info=True)
+                agent_error = str(e)
+
+            if agent_error:
+                await _emit({"type": "RUN_ERROR", "message": agent_error})
+            else:
+                await _emit({"type": "RUN_FINISHED", "threadId": thread_id, "runId": run_id})
+        except (ConnectionResetError, asyncio.CancelledError):
+            _agent = agent_ref[0] if agent_ref else None
+            if _agent is not None:
+                try:
+                    _agent.interrupt("client_disconnected")
+                except Exception:
+                    pass
+            raise
+        finally:
+            try:
+                await response.write_eof()
+            except Exception:
+                pass
+        return response
+
+    # ------------------------------------------------------------------
     # Cron jobs API
     # ------------------------------------------------------------------
 
@@ -4494,6 +4869,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            # AG-UI bridge (CopilotKit V2) — added routes, existing handlers untouched.
+            self._app.router.add_get("/ag-ui/info", self._handle_agui_info)
+            self._app.router.add_post("/ag-ui/agent/{agent_id}/run", self._handle_agui_run)
+            self._app.router.add_post("/ag-ui/agent/{agent_id}/connect", self._handle_agui_run)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the
