@@ -1,56 +1,58 @@
-// B3 round-trip SANS courriel: declenche confirmer_relance, clique REFUSER,
-// verifie que 'refuse' revient a Philippe (journal "Refusé" + accuse de Philippe).
-const { chromium } = require('playwright');
+// B3 round-trip SANS courriel (V2): déclenche confirmer_relance (useHumanInTheLoop),
+// clique REFUSER, vérifie que 'refuse' revient à Philippe (carte "Traité"/journal "Refusé").
+// 0 courriel envoyé. Sélecteurs V2 via v2-helpers.
+const { launch, openChat, send, bodyText, force } = require('./v2-helpers');
 const fs = require('fs');
-const URL = 'http://10.0.0.1:8083/';
+const URL = process.argv[2] || 'http://10.0.0.1:8083/';
 const DIR = '/tmp/copilot-debug';
 const out = []; const L = (s) => out.push(s);
 
 (async () => {
-  const browser = await chromium.launch({ args: ['--no-sandbox'] });
-  const page = await browser.newPage({ viewport: { width: 1200, height: 1000 } });
-  const css = `.copilotKitWindow,.copilotKitPopup{opacity:1 !important;visibility:visible !important;}`;
-  const chatInput = () => page.locator('.copilotKitInput textarea, .copilotKitWindow textarea').first();
-  const bodyText = () => page.locator('body').innerText().catch(()=> '');
+  const { browser, page } = await launch();
+  page.on('pageerror', e => L(`[PAGEERROR] ${e.message}`));
+  await page.goto(URL, { waitUntil: 'networkidle', timeout: 30000 }).catch(() => {});
+  await openChat(page);
 
-  await page.goto(URL, { waitUntil: 'networkidle', timeout: 30000 }).catch(()=>{});
-  await page.addStyleTag({ content: css }).catch(()=>{});
-  await page.waitForTimeout(1500);
-  const launcher = page.locator('.copilotKitButton').first();
-  if (!(await chatInput().isVisible().catch(()=>false)) && await launcher.count()) { await launcher.click(); await page.waitForTimeout(1500); }
-  await chatInput().waitFor({ state: 'visible', timeout: 10000 });
-
-  await chatInput().fill('Envoie une relance de paiement a Ramada Plaza Manoir du Casino pour 2 109,79 $.');
-  await chatInput().press('Enter');
+  await send(page, 'Envoie une relance de paiement a Ramada Plaza Manoir du Casino pour 2 109,79 $.');
   L('→ relance Ramada 2 109,79 $');
 
-  // attend la carte
+  // attend la carte d'approbation (texte de la carte HITL)
   let carte = false; const t0 = Date.now();
-  while (Date.now() - t0 < 60000) { await page.waitForTimeout(2000); if (/Approbation requise/i.test(await bodyText())) { carte = true; break; } }
+  while (Date.now() - t0 < 90000) {
+    await page.waitForTimeout(2500);
+    if (/Approbation requise/i.test(await bodyText(page))) { carte = true; break; }
+  }
   L(`carte approbation: ${carte}`);
 
-  // clic REFUSER via dispatchEvent (le onClick React, fiable en headless meme si
-  // l'element echoue les checks d'actionabilite Playwright).
+  // clic REFUSER via dispatchEvent (fiable en headless). Retry ~15s: la carte
+  // reste désormais en "executing" (boutons présents) jusqu'au respond().
   let clicked = false;
-  const btn = page.getByRole('button', { name: /^Refuser$/i }).first();
-  if (await btn.count()) { await btn.dispatchEvent('click').catch(e => L(`[clic] ${e.message}`)); clicked = true; }
+  const tBtn = Date.now();
+  while (Date.now() - tBtn < 15000 && !clicked) {
+    const btn = page.getByRole('button', { name: /Refuser/i }).first();
+    if (await btn.count()) {
+      await btn.dispatchEvent('click').catch(e => L(`[clic] ${e.message}`));
+      clicked = true;
+      break;
+    }
+    await page.waitForTimeout(1500);
+  }
   L(`clic Refuser: ${clicked}`);
 
-  // Marqueur correct: la carte passe a "Traité" (status complete) OU le journal
-  // affiche la pill "Refusé" (avec é exact — distinct du bouton "Refuser").
+  // marqueur: carte -> "Traité"/"Décision soumise" OU journal pill "Refusé"
   let refuse = false, txt = ''; const t1 = Date.now();
-  while (Date.now() - t1 < 45000) {
+  while (Date.now() - t1 < 60000) {
     await page.waitForTimeout(2500);
-    txt = await bodyText();
+    txt = await bodyText(page);
     if (/Trait[ée]/.test(txt) || /\bRefusé\b/.test(txt) || /Décision soumise/.test(txt)) { refuse = true; break; }
   }
-  await page.addStyleTag({ content: css }).catch(()=>{});
+  await force(page);
   await page.waitForTimeout(800);
-  await page.screenshot({ path: `${DIR}/prod-b3-refuse.png` });
+  await page.screenshot({ path: `${DIR}/prod-b3-refuse.png` }).catch(() => {});
   fs.writeFileSync(`${DIR}/prod-b3-refuse.txt`, txt);
   await browser.close();
 
-  L(`journal/round-trip 'refuse': ${refuse}`);
+  L(`round-trip 'refuse': ${refuse}`);
   L(`screenshot: ${DIR}/prod-b3-refuse.png`);
   console.log(out.join('\n'));
   process.exit(carte && clicked && refuse ? 0 : 2);

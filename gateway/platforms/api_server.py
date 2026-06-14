@@ -3485,7 +3485,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 + "\n".join(ctx_lines)
             )
 
-        # messages -> chat-format list, then split off the last user message.
+        # messages -> chat-format list. CRITICAL: the tool calls in this history
+        # are CLIENT tools (afficher_carte / ouvrir_facture / confirmer_relance);
+        # server (Zoho) tools never round-trip through the client. We FLATTEN
+        # these client tool round-trips to plain TEXT instead of replaying them
+        # as native function_call / function_response parts. Why: Gemini 3.x
+        # rejects replayed functionCall parts that lack a `thought_signature`
+        # (which CopilotKit doesn't preserve) — "Function call is missing a
+        # thought_signature". Plain text carries the same information (decision)
+        # without triggering that requirement.
+        tcid2name: Dict[str, str] = {}
         mapped: List[Dict[str, Any]] = []
         for m in raw_messages:
             if not isinstance(m, dict):
@@ -3493,52 +3502,76 @@ class APIServerAdapter(BasePlatformAdapter):
             role = m.get("role", "user")
             content = m.get("content", "") or ""
             if role == "assistant":
-                entry: Dict[str, Any] = {"role": "assistant", "content": content}
-                tcs = m.get("toolCalls") or m.get("tool_calls")
-                if tcs:
-                    norm_tcs = []
-                    for tc in tcs:
-                        if not isinstance(tc, dict):
-                            continue
-                        fn = tc.get("function", {}) or {}
-                        norm_tcs.append({
-                            "id": tc.get("id", ""),
-                            "type": "function",
-                            "function": {
-                                "name": fn.get("name", ""),
-                                "arguments": fn.get("arguments", "") or "",
-                            },
-                        })
-                    if norm_tcs:
-                        entry["tool_calls"] = norm_tcs
-                mapped.append(entry)
+                tcs = m.get("toolCalls") or m.get("tool_calls") or []
+                notes = []
+                for tc in tcs:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function", {}) or {}
+                    name = fn.get("name", "")
+                    args = fn.get("arguments", "") or ""
+                    tcid = tc.get("id", "")
+                    if tcid:
+                        tcid2name[tcid] = name
+                    notes.append(f"{name}({args})" if args else f"{name}()")
+                text = content
+                if notes:
+                    note_str = "[action interface demandée: " + "; ".join(notes) + "]"
+                    text = (content + "\n" + note_str) if content else note_str
+                mapped.append({"role": "assistant", "content": text})
             elif role == "tool":
-                tool_entry: Dict[str, Any] = {
-                    "role": "tool",
-                    "content": content if isinstance(content, str) else json.dumps(content),
-                }
-                tcid = m.get("toolCallId") or m.get("tool_call_id")
-                if tcid:
-                    tool_entry["tool_call_id"] = tcid
-                mapped.append(tool_entry)
+                tcid = m.get("toolCallId") or m.get("tool_call_id") or ""
+                name = tcid2name.get(tcid, "")
+                body_txt = content if isinstance(content, str) else json.dumps(content)
+                label = f"action « {name} »" if name else "action interface"
+                # Tool result becomes a USER turn (the human/UI response). Valid
+                # Gemini ordering and no functionCall parts to sign.
+                mapped.append({
+                    "role": "user",
+                    "content": f"[Résultat {label}: {body_txt}]",
+                })
             else:
                 mapped.append({"role": role, "content": content})
 
-        last_user_idx = None
-        for i in range(len(mapped) - 1, -1, -1):
-            if mapped[i].get("role") == "user":
-                last_user_idx = i
-                break
-        if last_user_idx is not None:
-            user_message = mapped[last_user_idx].get("content", "")
-            conversation_history = mapped[:last_user_idx] + mapped[last_user_idx + 1:]
+        # Only a message list ENDING in a user message is a fresh turn. If the
+        # last message is a tool result / assistant (HITL respond() round-trip),
+        # it's a CONTINUATION: keep the original order intact and let the agent
+        # resume from the function response. Pulling the user message out and
+        # re-appending it would put the assistant function_call first, which
+        # Gemini rejects ("function call turn must come after a user/function
+        # response turn").
+        if mapped and mapped[-1].get("role") == "user":
+            user_message = mapped[-1].get("content", "")
+            conversation_history = mapped[:-1]
         else:
-            # HITL continuation with no trailing user turn: feed everything as
-            # history and let the agent resume from the tool result.
             user_message = ""
             conversation_history = mapped
 
         session_id = thread_id or str(uuid.uuid4())
+
+        # The V2 client opens /connect with an EMPTY RunAgentInput (no messages)
+        # to establish/replay the agent stream. Running the agent with an empty
+        # user_message hits Gemini 400 ("contents is not specified") and wastes
+        # an LLM call. Short-circuit: emit an empty, well-formed AG-UI run.
+        has_history = any(
+            (m.get("content") or m.get("tool_calls")) for m in conversation_history
+        )
+        if not user_message and not has_history:
+            empty_headers = {
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            }
+            resp = web.StreamResponse(status=200, headers=empty_headers)
+            await resp.prepare(request)
+            await resp.write(
+                f"data: {json.dumps({'type': 'RUN_STARTED', 'threadId': thread_id, 'runId': run_id})}\n\n".encode()
+            )
+            await resp.write(
+                f"data: {json.dumps({'type': 'RUN_FINISHED', 'threadId': thread_id, 'runId': run_id})}\n\n".encode()
+            )
+            await resp.write_eof()
+            return resp
 
         # ── SSE setup: thread-safe queue fed by _run_agent callbacks ──
         import queue as _q
@@ -3565,6 +3598,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         pass
 
         def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
+            # Client tools (frontend actions / HITL) have NO server result: the
+            # agent is interrupted and the real result comes from the human via
+            # respond() on the NEXT run. The executor may still emit a spurious
+            # "Unknown tool" error result here — suppress it, otherwise CopilotKit
+            # marks the tool call complete and collapses the HITL card before the
+            # user can click (Approuver/Refuser disappear).
+            if function_name in client_tool_names:
+                return
             _stream_q.put(("__tool_completed__", {
                 "tool_call_id": tool_call_id,
                 "name": function_name,
