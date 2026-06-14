@@ -1,13 +1,15 @@
 "use client";
 
 import { useState, useCallback } from "react";
+import { z } from "zod";
 import {
-  CopilotKit,
-  useCopilotAction,
-  useCopilotReadable,
-} from "@copilotkit/react-core";
-import { CopilotPopup } from "@copilotkit/react-ui";
-import "@copilotkit/react-ui/styles.css";
+  CopilotKitProvider,
+  CopilotPopup,
+  useFrontendTool,
+  useHumanInTheLoop,
+  useAgentContext,
+} from "@copilotkitnext/react";
+import "@copilotkitnext/react/styles.css";
 
 // ---------------------------------------------------------------------------
 // Page PROD de Philippe (Hermès). Contrairement à /demo (gpt-4o-mini, données
@@ -142,9 +144,11 @@ function PhilippeCockpit() {
     ].slice(0, 10));
   }, []);
 
-  // --- Contexte de page exposé à Philippe (useCopilotReadable) ---
+  // --- Contexte de page exposé à Philippe (useAgentContext) ---
   // Philippe « voit » la facture actuellement ouverte sans qu'on la lui répète.
-  useCopilotReadable({
+  // Côté backend, ce contexte est injecté comme ephemeral_system_prompt: c'est
+  // CE point qui débloque le multi-tour readable ("la facture ouverte").
+  useAgentContext({
     description:
       "La facture MECG actuellement ouverte/affichée dans le panneau de l'interface prod. " +
       "Null si aucune facture n'est ouverte. Quand Justin parle de 'cette facture' ou 'la facture ouverte', " +
@@ -152,24 +156,35 @@ function PhilippeCockpit() {
     value: facture,
   });
 
+  // --- Instructions opératoires (V2 CopilotPopup n'a plus de prop `instructions`) ---
+  // Exposées comme contexte permanent -> ephemeral_system_prompt côté Philippe.
+  useAgentContext({
+    description: "Instructions d'usage de l'interface prod de Philippe",
+    value:
+      "Tu disposes d'OUTILS D'AFFICHAGE dans cette interface (en plus de tes outils Zoho). " +
+      "• FACTURES: quand Justin demande d'ouvrir/voir/afficher une facture, récupère D'ABORD les vraies " +
+      "données via tes outils Zoho Books (numéro, client, montant, statut, date), PUIS appelle 'ouvrir_facture' " +
+      "avec ces vraies données. Jamais de données inventées. " +
+      "• CARTES/RÉSUMÉS: pour un résumé visuel ou un état de comptes à recevoir, appelle 'afficher_carte' avec de vraies données Zoho. " +
+      "• RELANCES: quand Justin veut envoyer une relance/rappel de paiement, appelle TOUJOURS 'confirmer_relance' " +
+      "d'abord (client + montant). N'envoie le courriel via tes outils QUE si la réponse est 'approuve'. Si 'refuse', n'envoie rien.",
+  });
+
   // --- Pilier Generative UI : carte visuelle générique ---
-  useCopilotAction({
+  useFrontendTool({
     name: "afficher_carte",
-    available: "enabled",
     description:
       "Affiche une carte visuelle structurée dans le chat (Generative UI). Utilise-la pour présenter " +
       "un résumé, un mini-tableau de bord ou des données structurées (ex: comptes à recevoir, état d'un client). " +
       "Remplis-la avec de VRAIES données issues de tes outils Zoho.",
-    parameters: [
-      { name: "titre", type: "string", description: "Titre de la carte", required: true },
-      { name: "statut", type: "string", description: "ok, attention ou info", required: false },
-      {
-        name: "lignes",
-        type: "string",
-        description: "Lignes 'Label: Valeur' séparées par des retours à la ligne",
-        required: true,
-      },
-    ],
+    parameters: z.object({
+      titre: z.string().describe("Titre de la carte"),
+      statut: z.string().optional().describe("ok, attention ou info"),
+      lignes: z
+        .string()
+        .describe("Lignes 'Label: Valeur' séparées par des retours à la ligne"),
+    }),
+    handler: async ({ titre }) => `Carte « ${titre || "Carte"} » affichée.`,
     render: ({ args }) => {
       const lignes = (args.lignes || "")
         .split("\n")
@@ -183,27 +198,26 @@ function PhilippeCockpit() {
         });
       return <CarteGenerique titre={args.titre || "Carte"} lignes={lignes} statut={args.statut || "info"} />;
     },
-  });
+  }, []);
 
   // --- Pilier Frontend Action : ouvrir une VRAIE facture ---
   // Philippe récupère la facture via ses outils Zoho Books, puis appelle cette
   // action avec les vraies données pour l'afficher dans le panneau + une carte.
-  useCopilotAction({
+  useFrontendTool({
     name: "ouvrir_facture",
-    available: "enabled",
     description:
       "Affiche une facture MECG dans le panneau visuel ET dans le chat. " +
       "IMPORTANT: récupère D'ABORD les vraies données de la facture via tes outils Zoho Books " +
       "(numéro, client, montant, statut, date), PUIS appelle cette action avec ces vraies données. " +
       "Ne passe jamais de données inventées.",
-    parameters: [
-      { name: "numero", type: "string", description: "Numéro de la facture (ex: FAC-2301)", required: true },
-      { name: "client", type: "string", description: "Nom réel du client", required: false },
-      { name: "montant", type: "string", description: "Montant total formaté (ex: 2 109,79 $)", required: false },
-      { name: "statut", type: "string", description: "Statut réel (Payée, En attente, En souffrance…)", required: false },
-      { name: "date", type: "string", description: "Date de la facture", required: false },
-      { name: "details", type: "string", description: "Détail additionnel (PO, note)", required: false },
-    ],
+    parameters: z.object({
+      numero: z.string().describe("Numéro de la facture (ex: FAC-2301)"),
+      client: z.string().optional().describe("Nom réel du client"),
+      montant: z.string().optional().describe("Montant total formaté (ex: 2 109,79 $)"),
+      statut: z.string().optional().describe("Statut réel (Payée, En attente, En souffrance…)"),
+      date: z.string().optional().describe("Date de la facture"),
+      details: z.string().optional().describe("Détail additionnel (PO, note)"),
+    }),
     handler: async ({ numero, client, montant, statut, date, details }) => {
       const f = {
         numero: (numero || "").trim(),
@@ -217,23 +231,22 @@ function PhilippeCockpit() {
       return `Facture ${f.numero} affichée dans le panneau (client: ${f.client}, montant: ${f.montant}, statut: ${f.statut}).`;
     },
     render: ({ status, args }) => <CarteFacture args={args} status={status} />,
-  });
+  }, []);
 
   // --- Pilier Human-in-the-Loop : approbation avant relance réelle ---
   // Philippe propose une relance, la carte demande l'approbation, et la décision
   // ('approuve'/'refuse') est renvoyée à Philippe qui agit en conséquence.
-  useCopilotAction({
+  useHumanInTheLoop({
     name: "confirmer_relance",
-    available: "enabled",
     description:
       "Demande à Justin d'approuver ou refuser l'envoi d'une relance de paiement AVANT d'agir. " +
       "Appelle cette action avant tout envoi de courriel de relance. Retourne 'approuve' ou 'refuse'. " +
       "N'envoie le courriel QUE si la réponse est 'approuve'.",
-    parameters: [
-      { name: "client", type: "string", description: "Nom du client à relancer", required: true },
-      { name: "montant", type: "string", description: "Montant impayé (ex: 2 109,79 $)", required: true },
-    ],
-    renderAndWaitForResponse: ({ args, status, respond }) => {
+    parameters: z.object({
+      client: z.string().describe("Nom du client à relancer"),
+      montant: z.string().describe("Montant impayé (ex: 2 109,79 $)"),
+    }),
+    render: ({ args, status, respond }) => {
       const client = args?.client || "—";
       const montant = args?.montant || "—";
       const enAttente = status === "executing";
@@ -325,28 +338,19 @@ function PhilippeCockpit() {
 }
 
 export default function PhilippeUI() {
+  // runtimeUrl reste '/api/copilotkit' -> proxy same-origin -> bridge AG-UI
+  // de Philippe (agent id 'default'). Les instructions opératoires et le
+  // contexte de page sont fournis via useAgentContext (cf. PhilippeCockpit).
   return (
-    <CopilotKit runtimeUrl="/api/copilotkit">
+    <CopilotKitProvider runtimeUrl="/api/copilotkit">
       <PhilippeCockpit />
       <CopilotPopup
-        instructions={`Tu es Philippe, l'assistant de Mécanique Gicleurs (MECG). Tu parles à Justin Lacerte, le propriétaire. Réponds en français, ton direct et factuel.
-
-Tu disposes d'OUTILS D'AFFICHAGE dans cette interface (en plus de tes outils Zoho habituels). Utilise-les pour rendre tes réponses visuelles :
-
-• FACTURES : quand Justin demande d'ouvrir, voir, afficher ou consulter une facture, récupère D'ABORD les vraies données via tes outils Zoho Books (numéro, client, montant, statut, date), PUIS appelle l'action 'ouvrir_facture' avec ces vraies données pour l'afficher dans le panneau. Ne montre jamais de données inventées.
-
-• CARTES / RÉSUMÉS : pour un résumé visuel, un état de comptes à recevoir ou un mini-tableau de bord, appelle 'afficher_carte' avec de vraies données Zoho.
-
-• RELANCES : quand Justin veut envoyer une relance/rappel de paiement, appelle TOUJOURS 'confirmer_relance' d'abord (client + montant) pour obtenir son approbation. Tu n'envoies le courriel de relance via tes outils QUE si la réponse est 'approuve'. Si 'refuse', n'envoie rien.
-
-• CONTEXTE : la facture actuellement ouverte dans le panneau t'est exposée comme contexte. Quand Justin dit « cette facture » ou « la facture ouverte », c'est celle-là.`}
+        defaultOpen={false}
         labels={{
-          title: "Philippe",
-          initial: "Salut Justin ! Demande-moi d'ouvrir une facture, un résumé de tes comptes à recevoir, ou une relance.",
-          placeholder: "Écris ta question…",
+          chatInputPlaceholder: "Écris ta question…",
         }}
       />
-    </CopilotKit>
+    </CopilotKitProvider>
   );
 }
 
