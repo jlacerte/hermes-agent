@@ -1,0 +1,26 @@
+{
+  "name": "copilot-ui",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Vraie popup CopilotKit React pour Philippe (Hermes) — MECG",
+  "scripts": {
+    "dev": "next dev -H 10.0.0.1 -p 8083",
+    "build": "next build",
+    "start": "next start -H 10.0.0.1 -p 8083",
+    "debug": "node scripts/headless-debug.js",
+    "logs": "journalctl -u copilot-ui -n 100 --no-pager"
+  },
+  "devDependencies": {
+    "playwright": "^1.49.0"
+  },
+  "dependencies": {
+    "@copilotkit/react-core": "1.60.1",
+    "@copilotkit/react-textarea": "^1.60.1",
+    "@copilotkit/react-ui": "1.60.1",
+    "@copilotkit/runtime": "1.60.1",
+    "next": "^14.2.35",
+    "openai": "^4.67.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}
