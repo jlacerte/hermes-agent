@@ -9,6 +9,7 @@ import {
 } from "@copilotkit/runtime";
 import OpenAI from "openai";
 import { logInfo, logError } from "@/app/lib/logger";
+import { DEMO_ENABLED, demoDisabledResponse } from "@/app/lib/demo-gate";
 
 const DEMO_MODEL = process.env.DEMO_MODEL || "gpt-4o-mini";
 
@@ -24,6 +25,7 @@ const serviceAdapter = new OpenAIAdapter({
 const runtime = new CopilotRuntime();
 
 export const POST = async (req) => {
+  if (!DEMO_ENABLED) return demoDisabledResponse();
   const requestId = crypto.randomUUID().slice(0, 8);
 
   logInfo("copilotkit-demo", "requete entrante", {

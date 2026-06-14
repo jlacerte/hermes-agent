@@ -4,11 +4,13 @@
 // Ici: appel direct OpenAI -> complete le texte au curseur. Modele neutre, pas d'outils Zoho.
 import OpenAI from "openai";
 import { logInfo, logError } from "@/app/lib/logger";
+import { DEMO_ENABLED, demoDisabledResponse } from "@/app/lib/demo-gate";
 
 const DEMO_MODEL = process.env.DEMO_MODEL || "gpt-4o-mini";
 const openai = new OpenAI({ apiKey: process.env.DEMO_OPENAI_API_KEY || "missing-key" });
 
 export const POST = async (req) => {
+  if (!DEMO_ENABLED) return demoDisabledResponse();
   const requestId = crypto.randomUUID().slice(0, 8);
   const t0 = performance.now();
   try {
