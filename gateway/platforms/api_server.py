@@ -2998,6 +2998,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 })
             else:
                 client_tools.append(_t)
+        # Names of client tools: when the model invokes one, the agent must NOT
+        # execute it server-side (no implementation -> "Unknown tool" + apology
+        # loop). Instead we relay the function_call to the client and interrupt
+        # the agent (parity with /v1/chat/completions).
+        client_tool_names: set = {
+            t.get("function", {}).get("name")
+            for t in client_tools
+            if isinstance(t, dict) and t.get("function", {}).get("name")
+        }
 
         # conversation and previous_response_id are mutually exclusive
         if conversation and previous_response_id:
@@ -3111,6 +3120,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     "name": function_name,
                     "arguments": function_args or {},
                 }))
+                # AG-UI passthrough: a *client* tool (e.g. afficher_carte) has no
+                # server-side implementation. The function_call above is relayed
+                # to the client (which renders it); we must interrupt the agent so
+                # it does NOT try to execute the tool ("Unknown tool" -> apology
+                # loop). Parity with /v1/chat/completions._on_tool_start.
+                if function_name in client_tool_names:
+                    _agent = agent_ref[0] if agent_ref else None
+                    if _agent is not None:
+                        try:
+                            _agent.interrupt("client_tool_passthrough")
+                        except Exception:
+                            pass
 
             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
                 """Queue a completed tool result for live function_call_output streaming."""
