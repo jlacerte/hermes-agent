@@ -394,8 +394,10 @@ TOOLSETS = {
     },
 
     "hermes-api-server": {
-        "description": "OpenAI-compatible API server — full agent tools accessible via HTTP (no interactive UI tools like clarify or send_message)",
+        "description": "OpenAI-compatible API server — full agent tools accessible via HTTP (no interactive UI tools like clarify). send_message inclus: le client API (CopilotKit, VPN+cle) est un cockpit de confiance, l'agent doit pouvoir envoyer courriels/messages via l'outil dedie plutot que de scripter via execute_code.",
         "tools": [
+            # Messaging/email send (dedicated, validated, traceable — vs execute_code SMTP)
+            "send_message",
             # Web
             "web_search", "web_extract",
             # Terminal + process management
