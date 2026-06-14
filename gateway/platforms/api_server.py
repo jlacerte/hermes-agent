@@ -2971,6 +2971,34 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation = body.get("conversation")
         store = _coerce_request_bool(body.get("store"), default=True)
 
+        # AG-UI / OpenAI tool passthrough (parity with /v1/chat/completions):
+        # capture client-supplied tool definitions so they are injected into the
+        # agent surface by _run_agent.  CopilotKit's OpenAIAdapter talks to this
+        # endpoint (/v1/responses), so without this, frontend actions never reach
+        # the model.  Empty -> behaviour unchanged (full rétrocompat).
+        #
+        # The Responses API uses a FLAT function-tool shape
+        #   {"type":"function","name":...,"description":...,"parameters":...}
+        # whereas _run_agent (shared with chat/completions) expects the nested
+        # Chat Completions shape {"type":"function","function":{...}}.  Normalize
+        # flat tools to nested so the name is registered into the agent surface.
+        _raw_tools = body.get("tools") or []
+        client_tools: List[Dict[str, Any]] = []
+        for _t in _raw_tools:
+            if not isinstance(_t, dict):
+                continue
+            if _t.get("type") == "function" and "function" not in _t and _t.get("name"):
+                client_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": _t.get("name"),
+                        "description": _t.get("description", ""),
+                        "parameters": _t.get("parameters", {}),
+                    },
+                })
+            else:
+                client_tools.append(_t)
+
         # conversation and previous_response_id are mutually exclusive
         if conversation and previous_response_id:
             return web.json_response(_openai_error("Cannot use both 'conversation' and 'previous_response_id'"), status=400)
@@ -3105,6 +3133,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                client_tools=client_tools,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -3138,6 +3167,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                client_tools=client_tools,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
