@@ -347,6 +347,7 @@ export default function PhilippeUI() {
       <CopilotPopup
         defaultOpen={false}
         labels={{
+          modalHeaderTitle: "Philippe",
           chatInputPlaceholder: "Écris ta question…",
         }}
       />
