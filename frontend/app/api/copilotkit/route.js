@@ -21,7 +21,28 @@ const serviceAdapter = new OpenAIAdapter({
   model: HERMES_MODEL,
 });
 
-const runtime = new CopilotRuntime();
+// onError: trace les echecs upstream Hermes captes a l'interieur du pipeline
+// CopilotKit (au-dela du try/catch qui n'attrape que ce qui remonte de
+// handleRequest). Best-effort: selon la version/le mode (cloud vs self-hosted)
+// ce hook ne se declenche pas toujours -> le try/catch ci-dessous reste la
+// garantie de tracage. Voir tache PROD-A5 (doc 7f16373c §A5).
+const runtime = new CopilotRuntime({
+  onError: (errorEvent) => {
+    try {
+      logError("copilotkit", "onError pipeline", {
+        type: errorEvent?.type,
+        name: errorEvent?.error?.name || errorEvent?.name,
+        message: errorEvent?.error?.message || errorEvent?.message,
+        upstream: HERMES_URL,
+        context: errorEvent?.context
+          ? JSON.stringify(errorEvent.context).slice(0, 1000)
+          : undefined,
+      });
+    } catch (_) {
+      // ne jamais laisser le handler d'erreur planter le runtime
+    }
+  },
+});
 
 export const POST = async (req) => {
   const requestId = crypto.randomUUID().slice(0, 8);
@@ -53,15 +74,28 @@ export const POST = async (req) => {
   } catch (err) {
     const latencyMs = Math.round(performance.now() - t0);
 
-    logError("copilotkit", "erreur handleRequest", {
+    // Classifie l'echec upstream Hermes pour un diagnostic exploitable.
+    const code = err?.code || err?.cause?.code;
+    const upstreamDown = code === "ECONNREFUSED" || code === "ECONNRESET";
+    const timeout = code === "ETIMEDOUT" || code === "UND_ERR_HEADERS_TIMEOUT";
+    const kind = upstreamDown
+      ? "hermes_injoignable"
+      : timeout
+      ? "hermes_timeout"
+      : "hermes_erreur";
+
+    logError("copilotkit", "echec upstream Hermes", {
       requestId,
+      kind,
+      code,
       latencyMs,
+      upstream: HERMES_URL,
       error: err?.message,
       stack: err?.stack?.slice(0, 2000),
     });
 
     return Response.json(
-      { error: "Upstream error", requestId },
+      { error: "Upstream error", kind, requestId },
       { status: 502 }
     );
   }
