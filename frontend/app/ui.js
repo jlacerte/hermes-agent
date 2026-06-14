@@ -165,7 +165,9 @@ function PhilippeCockpit() {
       "• FACTURES: quand Justin demande d'ouvrir/voir/afficher une facture, récupère D'ABORD les vraies " +
       "données via tes outils Zoho Books (numéro, client, montant, statut, date), PUIS appelle 'ouvrir_facture' " +
       "avec ces vraies données. Jamais de données inventées. " +
-      "• CARTES/RÉSUMÉS: pour un résumé visuel ou un état de comptes à recevoir, appelle 'afficher_carte' avec de vraies données Zoho. " +
+      "• CARTES/RÉSUMÉS: quand Justin demande un résumé, un montant/total, une liste top-N (ex: top 3 factures impayées), " +
+      "un état de comptes à recevoir, un profil client ou un statut visuel, PRÉFÈRE appeler 'afficher_carte' (avec de vraies " +
+      "données Zoho) plutôt que de répondre en texte. Pour une simple question conversationnelle, réponds en texte normalement. " +
       "• RELANCES: quand Justin veut envoyer une relance/rappel de paiement, appelle TOUJOURS 'confirmer_relance' " +
       "d'abord (client + montant). N'envoie le courriel via tes outils QUE si la réponse est 'approuve'. Si 'refuse', n'envoie rien.",
   });
@@ -174,9 +176,12 @@ function PhilippeCockpit() {
   useFrontendTool({
     name: "afficher_carte",
     description:
-      "Affiche une carte visuelle structurée dans le chat (Generative UI). Utilise-la pour présenter " +
-      "un résumé, un mini-tableau de bord ou des données structurées (ex: comptes à recevoir, état d'un client). " +
-      "Remplis-la avec de VRAIES données issues de tes outils Zoho.",
+      "Affiche une carte visuelle structurée dans le chat (Generative UI). " +
+      "APPELLE CET OUTIL (au lieu de répondre en texte) dès que Justin demande : un résumé, un état/portrait, " +
+      "un montant ou un total, des comptes à recevoir, une liste top-N (ex: top 3 factures impayées), " +
+      "un statut visuel, un profil client, ou un mini-tableau de bord. " +
+      "Remplis la carte avec de VRAIES données issues de tes outils Zoho. " +
+      "N'utilise PAS cet outil pour une simple question conversationnelle (oui/non, une seule valeur en passant) : réponds alors en texte.",
     parameters: z.object({
       titre: z.string().describe("Titre de la carte"),
       statut: z.string().optional().describe("ok, attention ou info"),
