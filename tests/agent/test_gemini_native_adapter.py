@@ -367,6 +367,57 @@ def test_stream_event_translation_keeps_identical_calls_in_distinct_parts():
     assert tool_chunks[0].choices[0].delta.tool_calls[0].id != tool_chunks[1].choices[0].delta.tool_calls[0].id
 
 
+def test_stream_event_translation_splits_non_continuation_parallel_calls():
+    """Regression MECG (25c594f): two distinct parallel calls to the SAME tool
+    arriving at the same part_index across streaming events must land in
+    DISTINCT slots. Upstream keys only on (part_index, name, thought_signature),
+    so the second call overwrites the first on the same slot and its arguments
+    get concatenated -> "Extra data" corruption, args degrade to {} and the
+    model's second search is silently lost (Pascal's "Responses truncated").
+    The 'generation' counter allocates a fresh slot when incoming args are not
+    a continuation (equal or prefix-extension) of the slot's last_arguments.
+    """
+    from agent.gemini_native_adapter import translate_stream_event
+
+    def _event(args):
+        return {
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {"functionCall": {"name": "zoho_list_items", "args": args}}
+                        ]
+                    }
+                }
+            ]
+        }
+
+    tool_call_indices = {}
+    first = translate_stream_event(
+        _event({"search": "glycol"}),
+        model="gemini-2.5-flash",
+        tool_call_indices=tool_call_indices,
+    )
+    second = translate_stream_event(
+        _event({"search": "manometre"}),
+        model="gemini-2.5-flash",
+        tool_call_indices=tool_call_indices,
+    )
+
+    # Two distinct slots must be allocated (the bug collapsed them to one).
+    indices = sorted({slot["index"] for slot in tool_call_indices.values()})
+    assert indices == [0, 1]
+    assert first[0].choices[0].delta.tool_calls[0].index == 0
+    assert second[0].choices[0].delta.tool_calls[0].index == 1
+    assert (
+        first[0].choices[0].delta.tool_calls[0].id
+        != second[0].choices[0].delta.tool_calls[0].id
+    )
+    # Both searches survive intact (neither overwritten nor concatenated).
+    assert first[0].choices[0].delta.tool_calls[0].function.arguments == '{"search": "glycol"}'
+    assert second[0].choices[0].delta.tool_calls[0].function.arguments == '{"search": "manometre"}'
+
+
 def test_system_instruction_includes_role_field_and_stays_out_of_contents():
     from agent.gemini_native_adapter import build_gemini_request
 
