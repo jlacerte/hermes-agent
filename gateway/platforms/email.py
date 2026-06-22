@@ -273,6 +273,25 @@ class EmailAdapter(BasePlatformAdapter):
 
         logger.info("[Email] Adapter initialized for %s", self._address)
 
+
+    def _parse_subject_and_body(self, to_addr: str, body: str) -> tuple[str, str]:
+        """Extract explicit subject if present, otherwise use thread context."""
+        body_strip = body.strip()
+        lines = body_strip.split("\n", 1)
+        if lines and lines[0].lower().startswith("subject:"):
+            subject = lines[0][8:].strip()
+            new_body = lines[1].lstrip() if len(lines) > 1 else ""
+            if to_addr not in self._thread_context:
+                self._thread_context[to_addr] = {}
+            self._thread_context[to_addr]["subject"] = subject
+            return subject, new_body
+            
+        ctx = self._thread_context.get(to_addr, {})
+        subject = ctx.get("subject", "Hermes Agent")
+        if not subject.startswith("Re:"):
+            subject = f"Re: {subject}"
+        return subject, body
+
     def _trim_seen_uids(self) -> None:
         """Keep only the most recent UIDs to prevent unbounded memory growth.
 
@@ -529,14 +548,12 @@ class EmailAdapter(BasePlatformAdapter):
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        # Thread context for reply
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
+        # Parse custom subject if present
+        subject, body = self._parse_subject_and_body(to_addr, body)
         msg["Subject"] = subject
 
         # Threading headers
+        ctx = self._thread_context.get(to_addr, {})
         original_msg_id = reply_to_msg_id or ctx.get("message_id")
         if original_msg_id:
             msg["In-Reply-To"] = original_msg_id
@@ -640,12 +657,10 @@ class EmailAdapter(BasePlatformAdapter):
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
+        subject, body = self._parse_subject_and_body(to_addr, body)
         msg["Subject"] = subject
 
+        ctx = self._thread_context.get(to_addr, {})
         original_msg_id = ctx.get("message_id")
         if original_msg_id:
             msg["In-Reply-To"] = original_msg_id
@@ -721,12 +736,10 @@ class EmailAdapter(BasePlatformAdapter):
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
+        subject, body = self._parse_subject_and_body(to_addr, body)
         msg["Subject"] = subject
 
+        ctx = self._thread_context.get(to_addr, {})
         original_msg_id = ctx.get("message_id")
         if original_msg_id:
             msg["In-Reply-To"] = original_msg_id
