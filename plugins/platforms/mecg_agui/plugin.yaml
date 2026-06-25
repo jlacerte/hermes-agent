@@ -1,0 +1,33 @@
+name: mecg-agui-platform
+label: MECG AG-UI
+kind: platform
+version: 0.1.0
+description: >
+  Pont AG-UI (CopilotKit V2) <-> Hermès pour le copilote MECG, sous forme de
+  platform-plugin AUTONOME. Sert /ag-ui/* sur son propre serveur aiohttp et lance
+  les runs d'agent in-process, ce qui permet l'interruption de l'agent vivant à la
+  détection d'un outil client (afficher_carte, etc.) SANS éditer
+  gateway/platforms/api_server.py. But: découpler le pont du fichier upstream qui
+  est réécrit à chaque sync. Voir Archon Hermès 164018b3, docs e8cce433 / 17328275 / d3537356.
+
+  Inerte par défaut: ne s'active que si MECG_AGUI_ENABLED est vrai ET la plateforme
+  est activée en config. Discovery (import) sans effet sur le gateway en marche.
+author: Octopode (MECG)
+requires_env:
+  - name: MECG_AGUI_ENABLED
+    description: "Active le pont AG-UI (true/1/yes). Inerte sinon."
+    prompt: "Activer le pont AG-UI MECG ? (true/false)"
+    password: false
+optional_env:
+  - name: MECG_AGUI_PORT
+    description: "Port d'écoute du pont AG-UI (défaut: 8643)"
+    prompt: "Port AG-UI"
+    password: false
+  - name: MECG_AGUI_HOST
+    description: "Adresse de bind (défaut: 10.0.0.1, VPN-only)"
+    prompt: "Host AG-UI"
+    password: false
+  - name: MECG_AGUI_KEY
+    description: "Bearer token attendu sur les requêtes AG-UI (optionnel; vide = pas d'auth)"
+    prompt: "Clé AG-UI (ou vide)"
+    password: true
