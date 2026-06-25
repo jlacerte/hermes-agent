@@ -1,0 +1,7 @@
+name: phone
+version: 1.0.0
+description: "Appels téléphoniques sortants — Hermès appelle un numéro et dialogue vocalement via hermes-voice (Twilio + OpenAI Realtime). Outil: appeler_telephone(numero, raison). Déclenche localhost:8084/call (clé-protégé)."
+author: MECG
+kind: backend
+provides_tools:
+  - appeler_telephone
