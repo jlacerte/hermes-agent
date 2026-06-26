@@ -61,6 +61,16 @@ DEFAULT_PORT = 8643
 # comportement. C'est un choix de toolset, pas de routage.
 _AGENT_PLATFORM = "api_server"
 
+# Outils client « render-only / fire-and-forget » (useFrontendTool + render côté
+# frontend): leur résultat n'a aucune valeur sémantique pour l'agent, mais
+# CopilotKit V2 EXIGE un TOOL_CALL_RESULT pour considérer le run résolu. Sans lui,
+# le run reste ouvert et le tour suivant est bloqué (bug multi-tour, tâche Archon
+# 0a770bc0). Pour CEUX-LÀ SEULEMENT on émet un résultat synthétique avant
+# RUN_FINISHED. NE JAMAIS y ajouter un outil Human-in-the-Loop (confirmer_relance,
+# useHumanInTheLoop + respond): clôturer un HITL replierait la carte avant le clic
+# de l'utilisateur et casserait l'approbation (B3 DONE).
+RENDER_ONLY_PASSTHROUGH = {"afficher_carte", "ouvrir_facture"}
+
 
 def _env_truthy(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
@@ -518,6 +528,10 @@ class AGUIAdapter(BasePlatformAdapter):
         text_msg_id: Optional[str] = None
         final_text_parts: List[str] = []
         agent_error: Optional[str] = None
+        # toolCallId -> name des outils render-only démarrés mais pas encore
+        # clôturés par un TOOL_CALL_RESULT. Vidé par un vrai résultat (rare) ou,
+        # à défaut, par un résultat synthétique émis avant RUN_FINISHED.
+        pending_render_only: Dict[str, str] = {}
 
         async def _emit(event: Dict[str, Any]) -> None:
             await response.write(f"data: {json.dumps(event)}\n\n".encode())
@@ -553,9 +567,19 @@ class AGUIAdapter(BasePlatformAdapter):
             if args_str and args_str != "{}":
                 await _emit({"type": "TOOL_CALL_ARGS", "toolCallId": call_id, "delta": args_str})
             await _emit({"type": "TOOL_CALL_END", "toolCallId": call_id})
+            # Un outil render-only passthrough ne recevra jamais de vrai résultat
+            # serveur (l'agent est interrompu). On le note pour lui synthétiser un
+            # TOOL_CALL_RESULT avant RUN_FINISHED, sinon CopilotKit bloque le tour
+            # suivant. Les outils HITL ne sont PAS notés (clôture interdite).
+            if name in RENDER_ONLY_PASSTHROUGH:
+                pending_render_only[call_id] = name
 
         async def _emit_tool_completed(payload: Dict[str, Any]) -> None:
             call_id = payload.get("tool_call_id")
+            # Un vrai résultat serveur est arrivé: ce call est résolu, pas besoin
+            # de synthétiser pour lui.
+            if call_id is not None:
+                pending_render_only.pop(call_id, None)
             result = payload.get("result", "")
             result_str = result if isinstance(result, str) else json.dumps(result)
             await _emit({
@@ -565,6 +589,21 @@ class AGUIAdapter(BasePlatformAdapter):
                 "content": result_str,
                 "role": "tool",
             })
+
+        async def _flush_render_only() -> None:
+            # Clôt les outils render-only restés ouverts par un TOOL_CALL_RESULT
+            # synthétique. CopilotKit a besoin de ce résultat pour fermer le run;
+            # le handler réel (le rendu de la carte) s'exécute côté client et ne
+            # dépend pas de ce contenu. Marqueur explicite pour le débogage.
+            for call_id in list(pending_render_only):
+                await _emit({
+                    "type": "TOOL_CALL_RESULT",
+                    "messageId": f"msg_{uuid.uuid4().hex[:24]}",
+                    "toolCallId": call_id,
+                    "content": json.dumps({"rendered": True}),
+                    "role": "tool",
+                })
+                pending_render_only.pop(call_id, None)
 
         async def _dispatch(it) -> None:
             if isinstance(it, tuple) and len(it) == 2 and isinstance(it[0], str):
@@ -620,6 +659,9 @@ class AGUIAdapter(BasePlatformAdapter):
             if agent_error:
                 await _emit({"type": "RUN_ERROR", "message": agent_error})
             else:
+                # Clôturer les cartes render-only AVANT de finir le run, sinon
+                # CopilotKit garde le run ouvert et bloque le tour suivant.
+                await _flush_render_only()
                 await _emit({"type": "RUN_FINISHED", "threadId": thread_id, "runId": run_id})
         except (ConnectionResetError, asyncio.CancelledError):
             _agent = agent_ref[0] if agent_ref else None
