@@ -680,8 +680,12 @@ class AGUIAdapter(BasePlatformAdapter):
 
     # -- Cycle de vie ---------------------------------------------------------
 
-    async def connect(self) -> bool:
-        """Démarre le serveur aiohttp du pont AG-UI."""
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        """Démarre le serveur aiohttp du pont AG-UI.
+
+        ``is_reconnect`` (ajouté par upstream v0.18) est ignoré : le pont AG-UI
+        est un serveur HTTP sans file de messages à préserver entre reconnexions.
+        """
         if not AIOHTTP_AVAILABLE:
             logger.warning("[%s] aiohttp non installé", self.name)
             return False
