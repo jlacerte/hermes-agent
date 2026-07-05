@@ -430,8 +430,8 @@ TOOLSETS = {
     },
     
     "hermes-cli": {
-        "description": "Full interactive CLI toolset - all default tools plus cronjob management",
-        "tools": _HERMES_CORE_TOOLS,
+        "description": "Full interactive CLI toolset - all default tools plus cronjob management. send_message inclus: Justin (terminal, session confiee/supervisee) doit pouvoir demander l'envoi d'un courriel depuis la boite propre de Philippe (philippe@nxtcloud.ca) sans detour par execute_code.",
+        "tools": _HERMES_CORE_TOOLS + ["send_message"],
         "includes": []
     },
 
