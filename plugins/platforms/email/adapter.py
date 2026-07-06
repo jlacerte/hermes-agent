@@ -1228,11 +1228,22 @@ async def _standalone_send(
     if not all([address, password, smtp_host]):
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
+    # Honor a leading "Subject: ..." line (same convention as
+    # EmailAdapter._parse_subject_and_body) instead of hardcoding a default —
+    # this is the only place callers (send_message_tool's subject param,
+    # `hermes send --subject`) can set the header in the standalone path.
+    subject = "Hermes Agent"
+    body_strip = message.strip()
+    lines = body_strip.split("\n", 1)
+    if lines and lines[0].lower().startswith("subject:"):
+        subject = lines[0][8:].strip()
+        message = lines[1].lstrip() if len(lines) > 1 else ""
+
     try:
         msg = MIMEText(message, "plain", "utf-8")
         msg["From"] = address
         msg["To"] = chat_id
-        msg["Subject"] = "Hermes Agent"
+        msg["Subject"] = subject
         msg["Date"] = formatdate(localtime=True)
 
         server = smtplib.SMTP(smtp_host, smtp_port)
